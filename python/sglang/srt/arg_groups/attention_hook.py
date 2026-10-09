@@ -452,6 +452,74 @@ def handle_linear_attn_backend(server_args: Any):
                 cfg.mamba_ssm_dtype,
             )
 
+    if cfg.enable_flashinfer_gdn_tree_verify:
+        _validate_flashinfer_gdn_tree_verify(server_args, cfg)
+
+
+def _validate_flashinfer_gdn_tree_verify(server_args: Any, cfg: Any) -> None:
+    import torch
+
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        flashinfer_gdn_tree_verify_missing,
+    )
+
+    flag = "--enable-flashinfer-gdn-tree-verify"
+    if not (get_platform().is_cuda and torch.cuda.get_device_capability()[0] == 10):
+        raise ValueError(
+            f"{flag} needs the SM100/SM103 ReplaySSM kernels (B200/GB200/GB300)."
+        )
+    gdn = hybrid_gdn_config(model_config_of(server_args))
+    if gdn is None:
+        raise ValueError(f"{flag} is for hybrid GDN models (Qwen3-Next, Qwen3.5, ...).")
+    missing = flashinfer_gdn_tree_verify_missing()
+    if missing is not None:
+        raise ValueError(
+            f"{flag} needs a FlashInfer with the ReplaySSM tree verify and path commit "
+            f"(flashinfer-ai/flashinfer#6155, #6257); missing: {missing}."
+        )
+    if cfg.speculative_algorithm is None:
+        raise ValueError(f"{flag} only applies to speculative target-verify.")
+    draft = cfg.speculative_num_draft_tokens
+    if draft is None or not (4 <= draft <= 8):
+        raise ValueError(
+            f"{flag} requires 4 <= --speculative-num-draft-tokens <= 8 (tcgen05 "
+            f"verify window), got {draft!r}."
+        )
+    if cfg.speculative_adaptive:
+        raise ValueError(
+            f"{flag} needs a fixed draft length; --speculative-adaptive changes it at runtime."
+        )
+    K, V = gdn.linear_key_head_dim, gdn.linear_value_head_dim
+    if (K, V) != (128, 128):
+        raise ValueError(f"{flag} requires K = V = 128, got K={K}, V={V}.")
+    hv, h = (
+        gdn.linear_num_value_heads // cfg.tp_size,
+        gdn.linear_num_key_heads // cfg.tp_size,
+    )
+    if hv % 2 or (hv // max(h, 1)) % 2:
+        raise ValueError(
+            f"{flag} requires an even value-head count and an even HV/H ratio per "
+            f"TP rank, got HV={hv}, H={h} at tp={cfg.tp_size}."
+        )
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        raise ValueError(
+            f"{flag} and --enable-linear-replayssm(-spec) are mutually exclusive: "
+            "they are different verify/commit protocols over the same checkpoint."
+        )
+    if cfg.mamba_ssm_dtype is None:
+        logger.info(
+            "%s: setting --mamba-ssm-dtype float32 (frozen-checkpoint verify).", flag
+        )
+        declare_resolution(
+            server_args, "_handle_linear_attn_backend", mamba_ssm_dtype="float32"
+        )
+    elif cfg.mamba_ssm_dtype != "float32":
+        raise ValueError(
+            f"{flag} requires --mamba-ssm-dtype float32, got {cfg.mamba_ssm_dtype!r}; "
+            "the ReplaySSM verify reads and the commit folds an fp32 checkpoint."
+        )
+
 
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.

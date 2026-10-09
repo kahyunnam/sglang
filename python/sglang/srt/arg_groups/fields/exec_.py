@@ -492,6 +492,14 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    # FlashInfer ReplaySSM target-verify for GDN, chain or EAGLE tree: verify
+    # runs against the frozen fp32 checkpoint and records a per-slot raw-input
+    # window; the commit folds the accepted root-to-node path into the
+    # checkpoint. Replaces the per-draft full-state snapshots.
+    enable_flashinfer_gdn_tree_verify: A[
+        bool,
+        "Run GDN speculative target-verify (any --speculative-eagle-topk) on the FlashInfer ReplaySSM kernels: frozen fp32 checkpoint verify plus accept-path fold on commit, no per-draft SSM snapshots. SM100/SM103, K=V=128, 4 <= --speculative-num-draft-tokens <= 8, fp32 --mamba-ssm-dtype. Decode and prefill keep their own backends.",
+    ] = False
 
 
 class ExecGraph(msgspec.Struct):

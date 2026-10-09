@@ -523,6 +523,12 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        # FlashInfer ReplaySSM verify windows (--enable-flashinfer-gdn-tree-verify),
+        # slot-indexed like `temporal`: written by verify, folded by commit.
+        fi_replayssm_rawv: Optional[torch.Tensor] = None
+        fi_replayssm_rawk: Optional[torch.Tensor] = None
+        fi_replayssm_g: Optional[torch.Tensor] = None
+        fi_replayssm_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -637,6 +643,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_flashinfer_gdn_tree_verify: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -659,6 +666,13 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        # FlashInfer ReplaySSM verify owns rollback through its windows, so the
+        # per-draft SSM snapshots are skipped like under replayssm-spec.
+        self.fi_tree_verify = bool(
+            enable_flashinfer_gdn_tree_verify
+            and not cache_params.is_kda
+            and speculative_num_draft_tokens is not None
+        )
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
@@ -864,7 +878,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or self.fi_tree_verify:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -950,6 +964,33 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                fi_rawv = fi_rawk = fi_g = fi_beta = None
+                if self.fi_tree_verify:
+                    hv, v_dim, k_dim = temporal_state_shape
+                    h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
+                    T = speculative_num_draft_tokens
+                    fi_rawv = torch.zeros(
+                        (num_mamba_layers, size + 1, hv, T, v_dim),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    fi_rawk = torch.zeros(
+                        (num_mamba_layers, size + 1, h_k, T, k_dim),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    fi_g = torch.zeros(
+                        (num_mamba_layers, size + 1, hv, T),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    fi_beta = torch.zeros_like(fi_g)
+                    logger.info(
+                        "FlashInfer ReplaySSM tree verify enabled: windows "
+                        f"{tuple(fi_rawv.shape)} bf16 + {tuple(fi_rawk.shape)} bf16 + "
+                        f"2x{tuple(fi_g.shape)} fp32 ("
+                        f"{(get_tensor_size_bytes(fi_rawv) + get_tensor_size_bytes(fi_rawk) + 2 * get_tensor_size_bytes(fi_g)) / GB:.2f}GB)"
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -961,6 +1002,10 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    fi_replayssm_rawv=fi_rawv,
+                    fi_replayssm_rawk=fi_rawk,
+                    fi_replayssm_g=fi_g,
+                    fi_replayssm_beta=fi_beta,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -1356,6 +1401,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_flashinfer_gdn_tree_verify: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1395,6 +1441,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_flashinfer_gdn_tree_verify=enable_flashinfer_gdn_tree_verify,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1415,6 +1462,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_flashinfer_gdn_tree_verify: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1433,6 +1481,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_flashinfer_gdn_tree_verify=enable_flashinfer_gdn_tree_verify,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
