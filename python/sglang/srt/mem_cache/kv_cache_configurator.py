@@ -1449,6 +1449,10 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_flashinfer_gdn_tree_verify=(
+                get_exec().mamba.enable_flashinfer_gdn_tree_verify
+                and self.hybrid_gdn_config is not None
+            ),
         )
         return req_to_token_pool
 
@@ -1526,6 +1530,10 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+            ),
+            enable_flashinfer_gdn_tree_verify=(
+                get_exec().mamba.enable_flashinfer_gdn_tree_verify
+                and self.hybrid_gdn_config is not None
             ),
         )
         return req_to_token_pool

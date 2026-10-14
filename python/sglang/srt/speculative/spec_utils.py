@@ -930,6 +930,31 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def flashinfer_accept_paths(
+    accept_index: torch.Tensor, bs: int, draft_token_num: int
+) -> torch.Tensor:
+    """Per-request draft rows for ``gated_delta_rule_replayssm_commit``.
+
+    ``accept_index`` is ``[bs, tree_depth]`` of global node ids, -1 padded;
+    the commit wants ``[bs, T]`` rows local to each request, read only below
+    ``accept_lens``, so the padding value does not matter."""
+    depth = min(accept_index.shape[1], draft_token_num)
+    offsets = torch.arange(
+        0,
+        bs * draft_token_num,
+        draft_token_num,
+        dtype=accept_index.dtype,
+        device=accept_index.device,
+    )
+    accept_paths = torch.full(
+        (bs, draft_token_num), -1, dtype=torch.int32, device=accept_index.device
+    )
+    accept_paths[:, :depth] = (accept_index[:bs, :depth] - offsets[:, None]).to(
+        torch.int32
+    )
+    return accept_paths
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -967,6 +992,68 @@ def commit_mamba_states_after_verify(
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
+
+    # FlashInfer ReplaySSM (--enable-flashinfer-gdn-tree-verify): verify wrote the
+    # per-slot windows; fold the accepted root-to-node path into `temporal`.
+    if mamba_pool is not None and getattr(mamba_pool, "fi_tree_verify", False):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from flashinfer.gdn_decode import gated_delta_rule_replayssm_commit
+
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices[:bs])
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+        accept_paths = flashinfer_accept_paths(accept_index, bs, draft_token_num)
+        track_indices = batch.mamba_track_indices
+        gated_delta_rule_replayssm_commit(
+            spec_state.temporal,
+            spec_state.fi_replayssm_rawv,
+            spec_state.fi_replayssm_rawk,
+            spec_state.fi_replayssm_g,
+            spec_state.fi_replayssm_beta,
+            state_batch_indices.to(torch.int32),
+            accept_lens.to(torch.int32),
+            accept_paths,
+            track_state_indices=(
+                track_indices.to(torch.int32) if track_indices is not None else None
+            ),
+            track_steps=(
+                mamba_steps_to_track.to(torch.int32)
+                if mamba_steps_to_track is not None
+                else None
+            ),
+            null_block_id=-1,
+        )
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+            src_indices_raw,
+        )
+        if track_indices is not None:
+            fused_conv_window_scatter_with_mask(
+                spec_state.conv[0],
+                spec_state.intermediate_conv_window[0],
+                track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+        return
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the

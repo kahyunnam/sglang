@@ -170,6 +170,29 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
+def flashinfer_gdn_tree_verify_missing() -> Optional[str]:
+    """None when the installed FlashInfer has the ReplaySSM tree verify + path
+    commit, else a short reason."""
+    import inspect
+
+    try:
+        from flashinfer.gdn_decode import (
+            gated_delta_rule_mtp,
+            gated_delta_rule_replayssm_commit,
+        )
+    except ImportError as e:
+        return f"flashinfer.gdn_decode is not importable: {e}"
+    missing = []
+    if "verify_parents" not in inspect.signature(gated_delta_rule_mtp).parameters:
+        missing.append("gated_delta_rule_mtp(verify_parents=...)")
+    if (
+        "accept_paths"
+        not in inspect.signature(gated_delta_rule_replayssm_commit).parameters
+    ):
+        missing.append("gated_delta_rule_replayssm_commit(accept_paths=...)")
+    return ", ".join(missing) or None
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------

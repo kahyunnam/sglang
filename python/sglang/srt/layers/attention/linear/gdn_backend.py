@@ -535,6 +535,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
+        self._fi_tree_gate_params: dict = {}
+        self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
@@ -554,10 +557,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
+        self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        # Runs once per warmup and per captured forward, unlike the out-graph hook.
+        self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
+        self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
@@ -966,6 +979,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            use_flashinfer_tree = getattr(mamba_pool, "fi_tree_verify", False)
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -1064,7 +1078,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            if use_replayssm_fold:
+            if use_flashinfer_tree:
+                core_attn_out = self._flashinfer_replayssm_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    layer_cache=mamba_cache_params,
+                    cache_indices=cache_indices,
+                    draft_token_num=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+            elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
                     query=query,
@@ -1396,6 +1423,110 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_g=layer_cache.replayssm_g,
             replayssm_beta=layer_cache.replayssm_beta,
         )
+
+    def _flashinfer_tree_parents(
+        self, retrieve_parent_token: torch.Tensor, B: int, T: int
+    ) -> torch.Tensor:
+        """int32 [B, T] parents with the root at -1, built once per forward.
+
+        The conv kernel of the first GDN layer fills ``retrieve_parent_token``
+        (root parent 0); the cache is cleared by the per-forward metadata hooks,
+        so the copy runs in the first GDN layer of every forward, including the
+        captured one, and later layers reuse it."""
+        cached = self._fi_tree_parents_cache
+        if cached is not None and cached[0] is retrieve_parent_token:
+            return cached[1]
+        parents = torch.empty(
+            (B, T), dtype=torch.int32, device=retrieve_parent_token.device
+        )
+        parents.copy_(retrieve_parent_token[:B, :T])
+        parents[:, 0] = -1
+        self._fi_tree_parents_cache = (retrieve_parent_token, parents)
+        return parents
+
+    def _flashinfer_replayssm_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: "MambaPool.SpeculativeState",
+        cache_indices: torch.Tensor,
+        draft_token_num: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """FlashInfer ReplaySSM verify (chain or EAGLE tree) against the frozen
+        fp32 checkpoint. Writes this window's raw inputs to the per-slot
+        ``fi_replayssm_*`` windows; ``gated_delta_rule_replayssm_commit`` folds
+        the accepted path in at commit (spec_utils.commit_mamba_states_after_verify)."""
+        from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        T = draft_token_num
+        seq_len = query.numel() // (H * K)
+        B = seq_len // T
+        # tcgen05 is the only ReplaySSM path that honors verify_parents.
+        if B > 256 or not (4 <= T <= 8):
+            raise RuntimeError(
+                "--enable-flashinfer-gdn-tree-verify requires batch <= 256 and "
+                f"4 <= draft tokens <= 8 per verify, got B={B}, T={T}"
+            )
+        temporal = layer_cache.temporal
+        if temporal.dtype != torch.float32:
+            raise RuntimeError(
+                "--enable-flashinfer-gdn-tree-verify needs an fp32 SSM state pool, "
+                f"got {temporal.dtype}"
+            )
+        # Views, not copies: the kernel takes dynamic layouts, so strided
+        # q/k/v from the fused projection are read in place.
+        q = query.reshape(B, T, H, K)
+        k = key.reshape(B, T, H, K)
+        v = value.reshape(B, T, HV, V)
+        a = a.reshape(B, T, HV)
+        b = b.reshape(B, T, HV)
+        parents = None
+        if retrieve_parent_token is not None:
+            parents = self._flashinfer_tree_parents(retrieve_parent_token, B, T)
+        state_indices = cache_indices[:B]
+        if state_indices.dtype != torch.int32:
+            cached = self._fi_tree_indices_cache
+            if cached is not None and cached[0] is cache_indices:
+                state_indices = cached[1]
+            else:
+                state_indices = state_indices.to(torch.int32)
+                self._fi_tree_indices_cache = (cache_indices, state_indices)
+        gate = self._fi_tree_gate_params.get(layer.layer_id)
+        if gate is None:
+            gate = (
+                layer.A_log.detach().float().contiguous(),
+                layer.dt_bias.detach().float().contiguous(),
+            )
+            self._fi_tree_gate_params[layer.layer_id] = gate
+        A_log, dt_bias = gate
+        out, _ = gated_delta_rule_mtp(
+            q,
+            k,
+            v,
+            initial_state=temporal,
+            initial_state_indices=state_indices,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            disable_state_update=True,
+            use_qk_l2norm=True,
+            cache_replayssm=True,
+            verify_parents=parents,
+            replayssm_rawv=layer_cache.fi_replayssm_rawv,
+            replayssm_rawk=layer_cache.fi_replayssm_rawk,
+            replayssm_g=layer_cache.fi_replayssm_g,
+            replayssm_beta=layer_cache.fi_replayssm_beta,
+        )
+        return out.reshape(value.shape)
 
     def _replayssm_target_verify(
         self,
