@@ -537,6 +537,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.linear_attn_backends = backends
         self._fi_tree_gate_params: dict = {}
         self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
@@ -557,16 +558,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
         self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         super().init_forward_metadata_in_graph(forward_batch)
         # Runs once per warmup and per captured forward, unlike the out-graph hook.
         self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self._fi_tree_parents_cache = None
+        self._fi_tree_indices_cache = None
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
@@ -1477,17 +1481,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "--enable-flashinfer-gdn-tree-verify needs an fp32 SSM state pool, "
                 f"got {temporal.dtype}"
             )
-        q = query.reshape(B, T, H, K).contiguous()
-        k = key.reshape(B, T, H, K).contiguous()
-        v = value.reshape(B, T, HV, V).contiguous()
-        a = a.reshape(B, T, HV).contiguous()
-        b = b.reshape(B, T, HV).contiguous()
+        # Views, not copies: the kernel takes dynamic layouts, so strided
+        # q/k/v from the fused projection are read in place.
+        q = query.reshape(B, T, H, K)
+        k = key.reshape(B, T, H, K)
+        v = value.reshape(B, T, HV, V)
+        a = a.reshape(B, T, HV)
+        b = b.reshape(B, T, HV)
         parents = None
         if retrieve_parent_token is not None:
             parents = self._flashinfer_tree_parents(retrieve_parent_token, B, T)
         state_indices = cache_indices[:B]
         if state_indices.dtype != torch.int32:
-            state_indices = state_indices.to(torch.int32)
+            cached = self._fi_tree_indices_cache
+            if cached is not None and cached[0] is cache_indices:
+                state_indices = cached[1]
+            else:
+                state_indices = state_indices.to(torch.int32)
+                self._fi_tree_indices_cache = (cache_indices, state_indices)
         gate = self._fi_tree_gate_params.get(layer.layer_id)
         if gate is None:
             gate = (
