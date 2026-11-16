@@ -3610,6 +3610,24 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        if (
+            get_exec().mamba.enable_linear_attn_batch_invariant
+            and self.hybrid_gdn_config is not None
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_batch_invariant_spec import (
+                gdn_batch_invariant_side_bytes_per_slot,
+            )
+
+            # FlashInfer allocates this next to every pool slot on first use.
+            state_shape = config.mamba2_cache_params.shape
+            extra_per_slot += int(
+                gdn_batch_invariant_side_bytes_per_slot(
+                    num_q_heads=state_shape.num_k_heads_per_tp,
+                    num_v_heads=state_shape.temporal[0],
+                    num_layers=len(all_mamba_layers),
+                )
+                * pp_layer_scale
+            )
         fixed_state_bytes = replayssm_fixed_bytes
         if self.extra_mamba_cache_bytes_per_request_row:
             # live requests, the padding row and a PD decode's pre-allocated rows

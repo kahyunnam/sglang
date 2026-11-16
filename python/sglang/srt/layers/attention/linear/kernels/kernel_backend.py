@@ -1,6 +1,18 @@
 from abc import ABC, abstractmethod
 
+import msgspec
 import torch
+
+
+class ExtendStateSnapshots(msgspec.Struct, frozen=True):
+    """Prefix-cache snapshots one extend takes of its sequences' states."""
+
+    # Batch rows of the sequences to snapshot.
+    rows: list[int]
+    # Tokens past each row's prefix at which its state is wanted.
+    boundaries: list[int]
+    # [batch] pool slot each row's snapshot goes to.
+    destinations: torch.Tensor
 
 
 class LinearAttnKernelBase(ABC):
@@ -28,6 +40,10 @@ class LinearAttnKernelBase(ABC):
     # unwritten and corrupts prefix-cache restores. Kernels that reject
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
+
+    # True when extend() copies the prefix-cache state snapshots itself
+    # (`state_snapshots`), so the backend skips its own post-extend copy.
+    snapshots_extend_state: bool = False
 
     # True when extend() reads and writes each slot's recurrent state at the
     # pool's own slot pitch, so an envelope-strided pool needs no packed copy.

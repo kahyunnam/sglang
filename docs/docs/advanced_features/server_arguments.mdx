@@ -2113,6 +2113,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>2</code>, <code>3</code></td>
     </tr>
       <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-linear-attn-batch-invariant`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run GDN linear attention through FlashInfer&apos;s batch-invariant class (<code>gdn.bf16.c64</code>): a token&apos;s GDN output has the same bits from prefill, chunked prefill and decode, alone or in any batch. Replaces the <code>--linear-attn-*-backend</code> choices for GDN decode and prefill. Requires SM100 / SM103 / SM107, CUDA 13, <code>--mamba-ssm-dtype float32</code> and a FlashInfer build with the class. Decode is slower than the default kernels and each state slot keeps about 6 MB of extra memory per GDN layer. The prefix cache needs <code>--mamba-radix-cache-strategy extra_buffer</code> (prefill chunks and checkpoints then stay on the 64-token grid) or <code>--disable-radix-cache</code>. <code>--page-size</code> must divide 64 or be a multiple of it. Not supported with speculative decoding, ReplaySSM, unified memory, hierarchical cache, int8 checkpoints, PD disaggregation, DP attention, multi-item scoring, mixed chunks, two-batch overlap or streaming sessions.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+      <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-int8-mamba-checkpoint`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>

@@ -832,6 +832,9 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     tests, also leaves the cut.
     """
     ctx = get_context()
+    if linear_attn_batch_invariant_enabled():
+        # A slot only holds its last 64-token boundary state: cuts stay on it.
+        return mamba_cache_chunk_size()
     if not (
         ctx.is_config_namespace_published("exec")
         and ctx.is_config_namespace_published("parallel")
@@ -843,6 +846,14 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     if windows_retire_behind_checkpoints(tree_cache):
         return mamba_checkpoint_grid(tree_cache.page_size)
     return 1
+
+
+def linear_attn_batch_invariant_enabled() -> bool:
+    ctx = get_context()
+    return bool(
+        ctx.is_config_namespace_published("exec")
+        and get_exec().mamba.enable_linear_attn_batch_invariant
+    )
 
 
 def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> bool:
@@ -891,7 +902,10 @@ class PrefillAdder:
         # rounding would only shorten the chunk.
         self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
         # Whether every cut must land on that grid, never below it.
-        self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
+        self.strict_chunk_grid = (
+            windows_retire_behind_checkpoints(tree_cache)
+            or linear_attn_batch_invariant_enabled()
+        )
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -1812,6 +1826,8 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
