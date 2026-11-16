@@ -20,6 +20,7 @@ Columns are runner modes; rows are the linear-attention kernel backend. Cells us
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) (`atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the Triton kernel even before CG capture/replay) | ✓ EAGLE chain CG + EAGLE tree CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 | `flashinfer` prefill (SM100/SM103, FlashInfer 0.7.0) | ✓ KDA backend extend with beta logits, 128-D heads, and aligned/unaligned radix-cache snapshots; kernel tests cover BF16/FP32 and indexed state pools | — | — | — | — | — | — | — | — | — | — | — |
+| FlashInfer batch-invariant class (`--enable-linear-attn-batch-invariant`; SM100/SM103/SM107) | ✓ `test_kda_flashinfer_batch_invariant.py`: backend extend and decode, 128-D heads, convolution included; every comparison is bitwise | ✓ kernel-level decode step captured and replayed with padded rows | blocked: the prefill plans on the host | ✓ eager at the layer (not captured) | blocked: speculative decoding refused | blocked | blocked | blocked | blocked | blocked | blocked | blocked |
 
 ## Input And Config Coverage
 
@@ -72,3 +73,22 @@ keeps linear attention eager. Verify uses its separately resolved backend.
 ## Next Work
 
 - Add model-level Kimi K3 coverage when weights are available in the runner.
+
+## FlashInfer Batch-Invariant Contract
+
+`--enable-linear-attn-batch-invariant` replaces the decode and prefill kernels of
+every KDA layer by one FlashInfer class (`kda.bf16.c16`): a token's output bits
+depend on its own sequence only, and a decode step returns the bits a prefill of
+the same tokens returns. `test_kda_flashinfer_batch_invariant.py` asserts this
+with `torch.equal` for decode against teacher-forced prefill in changing
+batches, chunked prefill, prefix-cache snapshots, slot reuse and CUDA-graph
+replay, at the kernel adapter and through `KDAAttnBackend`.
+
+A state slot holds the state at the request's last 16-token boundary and
+FlashInfer keeps the open chunk beside the pool, so a slot may only be copied or
+restored at a multiple of 16 tokens. The backend refuses the configurations that
+break this (`kda_batch_invariant_refusal`), the scheduler keeps prefill cuts on
+the checkpoint chunk when the prefix cache is on, and the adapter raises instead
+of resuming or snapshotting off the grid. The class needs a safe gate, 128-D
+heads, equal key and value head counts and a float32 state pool; whether it
+covers the head count per rank is asked of the installed FlashInfer at startup.

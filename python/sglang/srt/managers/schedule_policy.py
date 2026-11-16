@@ -827,9 +827,10 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     #40907 donates from a prefix-relative snapshot, so rounding the cut would
     only drop up to one grid of prefill budget, except where windows retire
     behind the checkpoints (`windows_retire_behind_checkpoints`): a chunk below
-    the checkpoint grid takes none, so every cut lands on that grid. A
-    PrefillAdder built before the server config is published, as in unit
-    tests, also leaves the cut.
+    the checkpoint grid takes none, so every cut lands on that grid. The
+    batch-invariant KDA kernel can only snapshot a state on its 16-token grid,
+    so its cuts land on the checkpoint chunk too. A PrefillAdder built before
+    the server config is published, as in unit tests, also leaves the cut.
     """
     ctx = get_context()
     if not (
@@ -839,6 +840,8 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     ):
         return 1
     if get_parallel().dcp_enabled:
+        return mamba_cache_chunk_size()
+    if get_exec().mamba.enable_linear_attn_batch_invariant:
         return mamba_cache_chunk_size()
     if windows_retire_behind_checkpoints(tree_cache):
         return mamba_checkpoint_grid(tree_cache.page_size)
@@ -891,7 +894,10 @@ class PrefillAdder:
         # rounding would only shorten the chunk.
         self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
         # Whether every cut must land on that grid, never below it.
-        self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
+        self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache) or (
+            self.mamba_chunk_grid > 1
+            and get_exec().mamba.enable_linear_attn_batch_invariant
+        )
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator

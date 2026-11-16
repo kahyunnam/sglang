@@ -291,5 +291,160 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     build_flashinfer_kda_checkpoint_plan(batch, metadata, "cpu", 64)
 
 
+class TestKDABatchInvariantPolicy(CustomTestCase):
+    """The batch-invariant kernel keeps a slot's state at its last 16-token
+    boundary, so the mode must refuse every feature that moves a slot elsewhere."""
+
+    @staticmethod
+    def _config(**overrides):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        config = dict(
+            speculative_algorithm=None,
+            enable_linear_replayssm=False,
+            enable_int8_mamba_checkpoint=False,
+            enable_unified_memory=False,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            dcp_enabled=False,
+            enable_mixed_chunk=False,
+            enable_two_batch_overlap=False,
+            enable_nvidia_megakernel=False,
+            enable_streaming_session=False,
+            prefill_cuda_graph_backend=Backend.DISABLED,
+            radix_cache_enabled=True,
+            enable_mamba_extra_buffer=True,
+            mamba_track_interval=256,
+            cache_chunk_size=64,
+        )
+        config.update(overrides)
+        return config
+
+    def test_every_state_moving_feature_is_refused(self):
+        from sglang.srt.layers.attention.linear.kda_batch_invariant import (
+            kda_batch_invariant_refusal,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        self.assertIsNone(kda_batch_invariant_refusal(**self._config()))
+        self.assertIsNone(
+            kda_batch_invariant_refusal(
+                **self._config(
+                    radix_cache_enabled=False,
+                    enable_mamba_extra_buffer=False,
+                    mamba_track_interval=100,
+                )
+            )
+        )
+        self.assertIsNone(
+            kda_batch_invariant_refusal(
+                **self._config(prefill_cuda_graph_backend=Backend.BREAKABLE)
+            )
+        )
+        for overrides in (
+            dict(speculative_algorithm="EAGLE"),
+            dict(enable_linear_replayssm=True),
+            dict(enable_int8_mamba_checkpoint=True),
+            dict(enable_unified_memory=True),
+            dict(disaggregation_mode="decode"),
+            dict(enable_hierarchical_cache=True),
+            dict(dcp_enabled=True),
+            dict(enable_mixed_chunk=True),
+            dict(enable_two_batch_overlap=True),
+            dict(enable_nvidia_megakernel=True),
+            dict(enable_streaming_session=True),
+            dict(prefill_cuda_graph_backend=Backend.FULL),
+            # no_buffer caches the live slot at any token.
+            dict(enable_mamba_extra_buffer=False),
+            dict(mamba_track_interval=100),
+            dict(cache_chunk_size=24),
+        ):
+            with self.subTest(**overrides):
+                self.assertIsNotNone(
+                    kda_batch_invariant_refusal(**self._config(**overrides))
+                )
+
+    def test_models_outside_the_kernel_class_are_named(self):
+        import torch
+
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_batch_invariant import (
+            kda_batch_invariant_unsupported_reason,
+        )
+
+        # Ling-3.0-flash at TP 1 and TP 4, Kimi-K3 at TP 1 and TP 8;
+        # the head count is FlashInfer's to accept, at kernel construction.
+        ling = dict(
+            head_k_dim=128, head_v_dim=128, lower_bound=-5.0, state_dtype=torch.float32
+        )
+        for heads in (32, 8, 96, 12):
+            self.assertIsNone(
+                kda_batch_invariant_unsupported_reason(
+                    num_k_heads=heads, num_v_heads=heads, **ling
+                )
+            )
+        for overrides in (
+            dict(num_k_heads=32, num_v_heads=96),
+            # Kimi-Linear has the softplus gate.
+            dict(lower_bound=None),
+            dict(head_k_dim=32, head_v_dim=32),
+            dict(state_dtype=torch.bfloat16),
+        ):
+            with self.subTest(**overrides):
+                config = dict(num_k_heads=32, num_v_heads=32, **ling)
+                config.update(overrides)
+                self.assertIsNotNone(kda_batch_invariant_unsupported_reason(**config))
+
+    def test_extend_plan_keeps_snapshots_on_the_16_token_grid(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_batch_invariant import (
+            plan_kda_batch_invariant_extend,
+        )
+
+        # Row 0 snapshots at token 32 + 128 and finishes behind it; row 1 resumes
+        # inside a chunk; row 2 is empty.
+        first, second = plan_kda_batch_invariant_extend(
+            extend_lens=[150, 9, 0], prefix_lens=[32, 21, 0], cut_lens=[128, 0, 0]
+        )
+        self.assertEqual(
+            [(s.row, s.start, s.length, s.at_boundary) for s in first],
+            [(0, 0, 128, True), (1, 150, 9, False)],
+        )
+        self.assertEqual(
+            [(s.row, s.start, s.length, s.at_boundary) for s in second],
+            [(0, 128, 22, True)],
+        )
+        # Token 21 + 64 is inside a chunk: the slot never holds that state.
+        with self.assertRaisesRegex(ValueError, "multiple of 16"):
+            plan_kda_batch_invariant_extend(
+                extend_lens=[100], prefix_lens=[21], cut_lens=[64]
+            )
+
+    def test_prefill_cuts_land_on_the_checkpoint_chunk(self):
+        """With the prefix cache on, a cut inside a chunk would put the next
+        prefix-relative snapshot off the kernel's grid."""
+        from sglang.srt.managers.schedule_policy import mamba_prefill_chunk_grid
+        from sglang.srt.runtime_context import get_context
+
+        for fields, expected in (
+            (dict(enable_linear_attn_batch_invariant=True), 64),
+            (dict(enable_linear_attn_batch_invariant=False), 1),
+            (
+                dict(enable_linear_attn_batch_invariant=True, disable_radix_cache=True),
+                1,
+            ),
+        ):
+            with self.subTest(**fields):
+                override = get_context().override_server_args(
+                    mamba_radix_cache_strategy="extra_buffer",
+                    uses_mamba_radix_cache=True,
+                    _mamba_cache_chunk_size=64,
+                    **fields,
+                )
+                override.install()
+                try:
+                    self.assertEqual(mamba_prefill_chunk_grid(), expected)
+                finally:
+                    override.restore()
+
+
 if __name__ == "__main__":
     unittest.main()
