@@ -634,6 +634,20 @@ class ExecMamba(msgspec.Struct):
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None
+    enable_linear_attn_batch_invariant: A[
+        bool,
+        "Run GDN linear attention through FlashInfer's batch-invariant class "
+        "(gdn.bf16.c64): a token's GDN output has the same bits from prefill, "
+        "chunked prefill and decode, alone or in any batch. Replaces the "
+        "--linear-attn-*-backend choices for GDN decode and prefill. Requires "
+        "SM100/SM103/SM107, CUDA 13, --mamba-ssm-dtype float32 and a FlashInfer "
+        "build with the class; decode is slower than the default kernels and "
+        "each state slot keeps about 6 MB of extra memory per GDN layer. Not "
+        "supported with speculative decoding, ReplaySSM, unified memory, "
+        "hierarchical cache, int8 checkpoints, PD disaggregation, DP attention, "
+        "multi-item scoring, mixed chunks, two-batch overlap, streaming sessions "
+        "or the no_buffer radix strategy.",
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[

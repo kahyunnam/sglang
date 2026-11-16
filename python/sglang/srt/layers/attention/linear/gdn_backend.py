@@ -34,7 +34,16 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
 )
+from sglang.srt.layers.attention.linear.kernels.gdn_batch_invariant_spec import (
+    GDN_BATCH_INVARIANT_CHUNK,
+    GDN_BATCH_INVARIANT_HEAD_DIM,
+    build_extend_state_snapshots,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    ExtendStateSnapshots,
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     PoolStaging,
     stage_pool_states,
@@ -346,12 +355,36 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
     if (
         get_exec().deterministic.enable_deterministic_inference
         and backends.prefill.is_flashinfer()
+        # The batch-invariant class replaces the per-phase backends.
+        and not get_exec().mamba.enable_linear_attn_batch_invariant
     ):
         raise ValueError(
             "FlashInfer GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+
+
+def _validate_gdn_batch_invariant_model(model_runner: ModelRunner) -> None:
+    flag = "--enable-linear-attn-batch-invariant"
+    chunk, dim = GDN_BATCH_INVARIANT_CHUNK, GDN_BATCH_INVARIANT_HEAD_DIM
+    config = hybrid_gdn_config(model_runner.model_config)
+    model_chunk = getattr(
+        model_runner.model_config.hf_text_config, "mamba_chunk_size", chunk
+    )
+    if mamba_cache_chunk_size() % chunk != 0 or model_chunk != chunk:
+        raise ValueError(
+            f"{flag} needs state checkpoints on the {chunk}-token grid; the "
+            f"model's chunk is {model_chunk} and the mamba cache chunk is "
+            f"{mamba_cache_chunk_size()} tokens (set by --page-size)."
+        )
+    if config.linear_key_head_dim != dim or config.linear_value_head_dim != dim:
+        raise ValueError(
+            f"{flag} supports {dim}-wide GDN heads only; got key "
+            f"{config.linear_key_head_dim}, value {config.linear_value_head_dim}."
+        )
+    if model_runner.dtype != torch.bfloat16:
+        raise ValueError(f"{flag} requires --dtype bfloat16, got {model_runner.dtype}.")
 
 
 def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
@@ -378,9 +411,13 @@ class GDNKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
+        batch_invariant: bool = False,
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
+        if batch_invariant:
+            self._init_batch_invariant(triton_kernel)
+            return
         xpu_kernel = None
         if any(
             backend is not None and backend.is_intel_xpu()
@@ -517,6 +554,26 @@ class GDNKernelDispatcher:
             f"extend={self.extend_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
+        )
+
+    def _init_batch_invariant(self, triton_kernel: TritonGDNKernel) -> None:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer_batch_invariant import (
+            FlashInferBatchInvariantGDNKernel,
+        )
+
+        # One kernel serves decode and prefill; the class has no verify kernel
+        # and the arg hook refuses speculative decoding in this mode.
+        kernel = FlashInferBatchInvariantGDNKernel()
+        self.decode_kernel = kernel
+        self.extend_kernel = kernel
+        self.verify_kernel = triton_kernel
+        self.verify_kernel_is_flashinfer = False
+        self.verify_kernel_is_aiter = False
+        self.verify_conv_update = causal_conv1d_update
+        self.supports_packed_decode = True
+        rank0_log(
+            "GDN kernel dispatcher: batch-invariant mode, decode and extend="
+            f"{kernel.__class__.__name__}"
         )
 
     @property
@@ -673,9 +730,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # True when the extend kernel copies the prefix-cache snapshots itself.
+    snapshots_extend_state: bool = False
+    # Prefix-cache snapshots a batch-invariant extend takes itself, per forward.
+    extend_state_snapshots: Optional[ExtendStateSnapshots] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        return GDNKernelDispatcher(
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            batch_invariant=get_exec().mamba.enable_linear_attn_batch_invariant,
+        )
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -689,10 +755,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
             )
 
+        if get_exec().mamba.enable_linear_attn_batch_invariant:
+            _validate_gdn_batch_invariant_model(model_runner)
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self.snapshots_extend_state = (
+            self.kernel_dispatcher.extend_kernel.snapshots_extend_state
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -714,13 +785,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         kernel = self.kernel_dispatcher.extend_kernel
-        if not isinstance(kernel, FlashInferGDNKernel):
-            return
         geometries = {
             (layer.num_q_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim)
             for layer in model.modules()
             if isinstance(layer, RadixLinearAttention)
         }
+        if kernel.snapshots_extend_state:
+            self._prewarm_batch_invariant(kernel, geometries)
+            return
+        if not isinstance(kernel, FlashInferGDNKernel):
+            return
         # Only prefix-cache tracking asks the extend for state checkpoints.
         checkpoint_every_n_tokens = (
             mamba_cache_chunk_size()
@@ -747,10 +821,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"{time.perf_counter() - tic:.1f} s."
             )
 
+    def _prewarm_batch_invariant(
+        self, kernel: LinearAttnKernelBase, geometries: set[tuple[int, int, int, int]]
+    ) -> None:
+        tic = time.perf_counter()
+        for num_qk_heads, num_v_heads, _, _ in geometries:
+            kernel.prewarm(
+                num_qk_heads=num_qk_heads,
+                num_v_heads=num_v_heads,
+                io_dtype=self._model_runner.dtype,
+                device=torch.device(self.device),
+            )
+        rank0_log(
+            "Prewarmed FlashInfer batch-invariant GDN kernels in "
+            f"{time.perf_counter() - tic:.1f} s."
+        )
+
+    def _extend_state_snapshots(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[ExtendStateSnapshots]:
+        if not self.forward_metadata.has_mamba_track_mask:
+            return None
+        if self._has_cpu_prefill_track_metadata(forward_batch):
+            return build_extend_state_snapshots(
+                track_mask=forward_batch.mamba_prefill_track_mask_cpu,
+                track_seqlens=forward_batch.mamba_track_seqlens_cpu,
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                destinations=forward_batch.mamba_track_indices,
+            )
+        return build_extend_state_snapshots(
+            track_mask=forward_batch.mamba_track_mask.tolist(),
+            track_seqlens=forward_batch.mamba_track_seqlens.tolist(),
+            prefix_lens=forward_batch.extend_prefix_lens.tolist(),
+            destinations=forward_batch.mamba_track_indices,
+        )
+
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
         return (
             envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            # The batch-invariant extend reads host metadata and builds tails eagerly.
+            and not self.snapshots_extend_state
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
             and self._prefill_graph_extend_supported()
@@ -937,6 +1048,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ),
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        # Once per forward: every layer snapshots the same rows.
+        self.extend_state_snapshots = (
+            self._extend_state_snapshots(forward_batch)
+            if self.snapshots_extend_state
+            and forward_batch.forward_mode.is_extend()
+            else None
+        )
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -1665,6 +1783,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=kwargs.get("linear_attn_output"),
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                state_snapshots=self.extend_state_snapshots,
                 track_state=h_track_buf,
                 needs_track_state=(
                     forward_metadata.has_mamba_track_mask
@@ -1692,7 +1813,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     staging,
                 )
 
-            if forward_metadata.has_mamba_track_mask:
+            if (
+                forward_metadata.has_mamba_track_mask
+                and not self.snapshots_extend_state
+            ):
                 self._track_mamba_state_extend(
                     forward_batch,
                     h,

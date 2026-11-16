@@ -292,6 +292,51 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _deterministic_aiter_prefill_page_size)
 
 
+def _validate_linear_attn_batch_invariant(server_args: Any) -> None:
+    # FlashInfer keeps a slot's open 64-token chunk next to the state pool:
+    # only paths that hand a state over on that grid qualify.
+    cfg = resolving_view(server_args)
+    flag = "--enable-linear-attn-batch-invariant"
+    if uses_kda_attention(model_config_of(server_args).hf_config):
+        raise ValueError(f"{flag} supports GDN models only, not KDA.")
+    if cfg.mamba_ssm_dtype != "float32":
+        raise ValueError(
+            f"{flag} requires --mamba-ssm-dtype float32, got {cfg.mamba_ssm_dtype!r}."
+        )
+    unsupported = {
+        "speculative decoding": cfg.speculative_algorithm is not None,
+        "--enable-linear-replayssm": cfg.enable_linear_replayssm,
+        "--enable-linear-replayssm-spec": cfg.enable_linear_replayssm_spec,
+        "--enable-int8-mamba-checkpoint": cfg.enable_int8_mamba_checkpoint,
+        "--enable-unified-memory": cfg.enable_unified_memory,
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "PD disaggregation": cfg.disaggregation_mode != "null",
+        "--enable-dp-attention": cfg.enable_dp_attention,
+        "--enable-mis": cfg.enable_mis,
+        "--enable-mixed-chunk": cfg.enable_mixed_chunk,
+        "--enable-two-batch-overlap": cfg.enable_two_batch_overlap,
+        "--enable-streaming-session": cfg.enable_streaming_session,
+        "--enable-session-radix-cache": cfg.enable_session_radix_cache,
+    }
+    enabled = [name for name, on in unsupported.items() if on]
+    if enabled:
+        raise ValueError(f"{flag} is not supported with {', '.join(enabled)}.")
+    if not cfg.disable_radix_cache and not mamba_extra_buffer_of(
+        resolved_view(server_args)
+    ):
+        raise ValueError(
+            f"{flag} keeps prefix-cache states on the 64-token grid: use "
+            "--mamba-radix-cache-strategy extra_buffer or --disable-radix-cache; "
+            f"got --mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
+        )
+    page_size = cfg.page_size
+    if page_size is not None and 64 % page_size != 0 and page_size % 64 != 0:
+        raise ValueError(
+            f"{flag} requires a --page-size that divides 64 or is a multiple of "
+            f"it, got {page_size}."
+        )
+
+
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
@@ -405,6 +450,9 @@ def handle_linear_attn_backend(server_args: Any):
             "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
             f"got CUDA {cuda_version or 'unknown'}"
         )
+
+    if cfg.enable_linear_attn_batch_invariant:
+        _validate_linear_attn_batch_invariant(server_args)
 
     # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
     # cuda-graph is supported (slice 1b: CUDA-graph-safe static
