@@ -90,4 +90,5 @@ restored at a multiple of 16 tokens. The backend refuses the configurations that
 break this (`kda_batch_invariant_refusal`), the scheduler keeps prefill cuts on
 the checkpoint chunk when the prefix cache is on, and the adapter raises instead
 of resuming or snapshotting off the grid. The class needs a safe gate, 128-D
-heads, an equal power-of-two head count and a float32 state pool.
+heads, equal key and value head counts and a float32 state pool; whether it
+covers the head count per rank is asked of the installed FlashInfer at startup.

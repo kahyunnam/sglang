@@ -371,20 +371,19 @@ class TestKDABatchInvariantPolicy(CustomTestCase):
             kda_batch_invariant_unsupported_reason,
         )
 
-        # Ling-3.0-flash at TP 1 and TP 4.
+        # Ling-3.0-flash at TP 1 and TP 4, Kimi-K3 at TP 1 and TP 8;
+        # the head count is FlashInfer's to accept, at kernel construction.
         ling = dict(
             head_k_dim=128, head_v_dim=128, lower_bound=-5.0, state_dtype=torch.float32
         )
-        for heads in (32, 8):
+        for heads in (32, 8, 96, 12):
             self.assertIsNone(
                 kda_batch_invariant_unsupported_reason(
                     num_k_heads=heads, num_v_heads=heads, **ling
                 )
             )
         for overrides in (
-            # Kimi-K3 has 96 heads: 12 per rank at TP 8.
-            dict(num_k_heads=96, num_v_heads=96),
-            dict(num_k_heads=12, num_v_heads=12),
+            dict(num_k_heads=32, num_v_heads=96),
             # Kimi-Linear has the softplus gate.
             dict(lower_bound=None),
             dict(head_k_dim=32, head_v_dim=32),

@@ -62,7 +62,7 @@ def gates():
     )
 
 
-def _sequence(seed: int, length: int):
+def _sequence(seed: int, length: int, heads: int = HEADS):
     """q, k, v, raw gate, beta logit rows of one request; gates near 0 keep a long memory."""
     generator = torch.Generator(device=DEVICE).manual_seed(seed)
 
@@ -70,16 +70,18 @@ def _sequence(seed: int, length: int):
         return torch.randn(*shape, device=DEVICE, generator=generator)
 
     return (
-        randn(length, HEADS, DIM).bfloat16(),
-        randn(length, HEADS, DIM).bfloat16(),
-        randn(length, HEADS, DIM).bfloat16(),
-        (randn(length, HEADS, DIM) - 4.0).bfloat16(),
-        randn(length, HEADS).bfloat16(),
+        randn(length, heads, DIM).bfloat16(),
+        randn(length, heads, DIM).bfloat16(),
+        randn(length, heads, DIM).bfloat16(),
+        (randn(length, heads, DIM) - 4.0).bfloat16(),
+        randn(length, heads).bfloat16(),
     )
 
 
-def _new_pool(kernel: FlashInferKDABatchInvariantKernel) -> torch.Tensor:
-    pool = torch.zeros(SLOTS, HEADS, DIM, DIM, device=DEVICE)
+def _new_pool(
+    kernel: FlashInferKDABatchInvariantKernel, heads: int = HEADS
+) -> torch.Tensor:
+    pool = torch.zeros(SLOTS, heads, DIM, DIM, device=DEVICE)
     kernel.register_state_pool(pool)
     return pool
 
@@ -110,11 +112,12 @@ def _decode(kernel, pool, gates, tokens, slots):
     """One decode step; ``tokens[i]`` is a 5-tuple of single rows for ``slots[i]``."""
     q, k, v, a, b = (torch.stack([token[i] for token in tokens]) for i in range(5))
     batch = len(slots)
+    heads = q.shape[-2]
     return kernel.decode(
         q.unsqueeze(0),
         k.unsqueeze(0),
         v.unsqueeze(0),
-        a.reshape(batch, HEADS * DIM),
+        a.reshape(batch, heads * DIM),
         b.unsqueeze(0),
         ssm_states=pool,
         cache_indices=torch.tensor(slots, dtype=torch.int32, device=DEVICE),
@@ -529,6 +532,68 @@ def test_backend_prefix_checkpoint_restores_bitwise(harness):
         ForwardMode.EXTEND, [_rows(request, 128, 200)], [2], [128]
     )[0]
     assert torch.equal(resumed, reference[128:])
+
+def test_head_count_outside_the_flashinfer_class_is_refused(kernel):
+    """The class's head counts are FlashInfer's; a pool it does not cover never registers."""
+    pool = torch.zeros(2, 20, DIM, DIM, device=DEVICE)
+    with pytest.raises(ValueError, match=r"\(20 KDA heads per rank\)"):
+        kernel.register_state_pool(pool)
+
+
+def test_decode_equals_prefill_at_the_kimi_k3_head_count(kernel):
+    """96 heads (Kimi-K3 at TP 1): mixed-batch decode rows are the request's prefill rows."""
+    heads = 96
+    try:
+        pool = _new_pool(kernel, heads)
+    except ValueError as exc:
+        # Only FlashInfer's own refusal of this head count is a reason to skip.
+        if f"does not support {heads} heads" not in str(exc):
+            raise
+        pytest.skip(f"this FlashInfer build does not cover {heads} heads: {exc}")
+    generator = torch.Generator(device=DEVICE).manual_seed(9)
+    gates = dict(
+        A_log=torch.randn(heads, device=DEVICE, generator=generator) * 0.2,
+        dt_bias=torch.randn(heads * DIM, device=DEVICE, generator=generator) * 0.1,
+        lower_bound=-5.0,
+    )
+    prompts = {1: 5, 2: 16, 3: 37}
+    total = 70
+    sequences = {slot: _sequence(300 + slot, total, heads) for slot in prompts}
+    reference = {}
+    for slot, sequence in sequences.items():
+        alone = _new_pool(kernel, heads)
+        reference[slot] = _extend(kernel, alone, gates, [sequence], [1], [0])[0]
+
+    slots = list(prompts)
+    got = {
+        slot: [output]
+        for slot, output in zip(
+            slots,
+            _extend(
+                kernel,
+                pool,
+                gates,
+                [_rows(sequences[s], 0, prompts[s]) for s in slots],
+                slots,
+                [0] * len(slots),
+            ),
+        )
+    }
+    for step in range(total - max(prompts.values())):
+        order = slots[step % len(slots) :] + slots[: step % len(slots)]
+        position = {s: prompts[s] + step for s in order}
+        output = _decode(
+            kernel,
+            pool,
+            gates,
+            [_rows(sequences[s], position[s], position[s] + 1) for s in order],
+            order,
+        )
+        for row, slot in enumerate(order):
+            got[slot].append(output[row : row + 1].reshape(1, heads, DIM))
+    for slot in slots:
+        produced = torch.cat(got[slot])
+        assert torch.equal(produced, reference[slot][: produced.shape[0]]), slot
 
 
 if __name__ == "__main__":

@@ -84,10 +84,10 @@ def kda_batch_invariant_unsupported_reason(
             f"head dims K={head_k_dim}, V={head_v_dim}; the class needs "
             f"{KDA_BATCH_INVARIANT_HEAD_DIM}"
         )
-    if num_k_heads != num_v_heads or num_v_heads & (num_v_heads - 1):
+    if num_k_heads != num_v_heads:
         return (
             f"{num_k_heads} key heads and {num_v_heads} value heads; the class "
-            "needs equal, power-of-two head counts"
+            "needs equal head counts"
         )
     if lower_bound is None or not lower_bound < 0.0:
         return (
@@ -183,6 +183,7 @@ class FlashInferKDABatchInvariantKernel(LinearAttnKernelBase):
         self._append = recurrent_kda_batch_invariant_extend
         self._reset = recurrent_kda_batch_invariant_reset
         self._state_chunk_size = state_chunk_size
+        self._checked_head_counts: set[int] = set()
         self._gate_cache: dict = {}
         # (pool address, slot) -> tokens the slot holds after its last extend;
         # the only state an extend that starts inside a chunk may continue.
@@ -196,9 +197,46 @@ class FlashInferKDABatchInvariantKernel(LinearAttnKernelBase):
                 f"got {ssm_states.dtype}, strides {tuple(ssm_states.stride())} "
                 "(use --mamba-ssm-dtype float32 and a static, non-unified state pool)"
             )
+        self._check_head_count(
+            num_heads=ssm_states.shape[1], device=ssm_states.device
+        )
         self._reset(
             ssm_states, torch.zeros(1, dtype=torch.int32, device=ssm_states.device)
         )
+
+    def _check_head_count(self, *, num_heads: int, device: torch.device) -> None:
+        """Raise unless the installed FlashInfer runs the class at this head count."""
+        if num_heads in self._checked_head_counts:
+            return
+        from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+        dim = KDA_BATCH_INVARIANT_HEAD_DIM
+        rows = torch.zeros(1, 1, num_heads, dim, dtype=torch.bfloat16, device=device)
+        # The head counts the class covers are FlashInfer's to state;
+        # one decode step on a scratch pool is the only public way to ask.
+        try:
+            self._recurrent_kda(
+                q=rows,
+                k=rows,
+                v=rows,
+                g=rows,
+                beta=rows[..., 0].contiguous(),
+                A_log=torch.zeros(num_heads, device=device),
+                dt_bias=torch.zeros(num_heads * dim, device=device),
+                initial_state=torch.zeros(1, num_heads, dim, dim, device=device),
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                lower_bound=-1.0,
+                beta_is_logit=True,
+                batch_invariant=True,
+            )
+        except BatchInvariantUnsupportedError as exc:
+            raise ValueError(
+                "--enable-linear-attn-batch-invariant: the installed FlashInfer "
+                f"refused the class for this model ({num_heads} KDA heads per "
+                f"rank): {exc}"
+            ) from exc
+        self._checked_head_counts.add(num_heads)
 
     def _gate_params(self, A_log: torch.Tensor, dt_bias: torch.Tensor):
         key = (id(A_log), id(dt_bias))
