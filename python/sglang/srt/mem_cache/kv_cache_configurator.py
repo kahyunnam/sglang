@@ -41,6 +41,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_batch_invariant import (
+    kda_batch_invariant_state_bytes_per_slot,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -3610,6 +3613,18 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        if (
+            get_exec().mamba.enable_linear_attn_batch_invariant
+            and self.hybrid_kda_config is not None
+        ):
+            # FlashInfer keeps the open chunk's rows per slot beside the pool.
+            extra_per_slot += int(
+                kda_batch_invariant_state_bytes_per_slot(
+                    num_layers=len(config.mamba2_cache_params.layers),
+                    num_heads=config.mamba2_cache_params.shape.temporal[0],
+                )
+                * pp_layer_scale
+            )
         fixed_state_bytes = replayssm_fixed_bytes
         if self.extra_mamba_cache_bytes_per_request_row:
             # live requests, the padding row and a PD decode's pre-allocated rows

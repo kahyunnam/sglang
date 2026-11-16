@@ -36,6 +36,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
 )
+from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -295,6 +296,16 @@ def handle_attention_backend_compatibility(server_args: Any):
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
+
+    if (
+        cfg.enable_linear_attn_batch_invariant
+        and hybrid_kda_config(model_config_of(server_args)) is None
+    ):
+        # Without a KDA layer the flag would only change prefill scheduling.
+        raise ValueError(
+            "--enable-linear-attn-batch-invariant needs a model with KDA linear "
+            "attention; this model has none."
+        )
 
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and

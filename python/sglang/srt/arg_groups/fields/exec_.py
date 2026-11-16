@@ -634,6 +634,23 @@ class ExecMamba(msgspec.Struct):
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None
+    enable_linear_attn_batch_invariant: A[
+        bool,
+        "Run KDA linear attention on FlashInfer's batch-invariant kernel class "
+        "(kda.bf16.c16; SM100, SM103 and SM107) for prefill, chunked prefill and "
+        "decode, in place of --linear-attn-backend and its per-mode overrides: a "
+        "KDA layer's output bits for a token depend on that token's own sequence "
+        "only, and a decode step returns the bits a prefill of the same tokens "
+        "returns. The guarantee covers the KDA layers; other layers keep their "
+        "own batch behaviour. Requires a FlashInfer build that provides the "
+        "class, a safe-gate KDA model with 128-dim heads and a power-of-two head "
+        "count per rank, a float32 state pool, and either --disable-radix-cache "
+        "or --mamba-radix-cache-strategy extra_buffer with --mamba-track-interval "
+        "a multiple of 16. Refused with speculative decoding, ReplaySSM, int8 "
+        "mamba checkpoints, unified memory, PD disaggregation, hierarchical "
+        "cache, DCP, mixed chunks, two-batch overlap, streaming sessions, the "
+        "NVIDIA megakernel and full prefill CUDA graphs.",
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[

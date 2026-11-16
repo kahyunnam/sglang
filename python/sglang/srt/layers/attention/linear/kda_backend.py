@@ -11,6 +11,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_batch_invariant import (
+    create_kda_batch_invariant_kernel,
+)
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillGraphMetadata,
     KDAPrefillTrackRows,
@@ -21,6 +24,9 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
@@ -108,8 +114,10 @@ class KDAKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: LinearAttnKernelBackend,
+        batch_invariant_kernel: Optional[LinearAttnKernelBase] = None,
     ):
         self.verify_backend = verify_backend
+        self.batch_invariant = batch_invariant_kernel is not None
         self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
         self.triton_kernel = triton_kernel
@@ -271,6 +279,12 @@ class KDAKernelDispatcher:
                 "SM100, ptx_kda SM100 or SM103)."
             )
 
+        if batch_invariant_kernel is not None:
+            # One kernel class serves prefill and decode; the per-mode backends
+            # above stay built but never run.
+            self.decode_kernel = batch_invariant_kernel
+            self.extend_kernel = batch_invariant_kernel
+
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
@@ -334,12 +348,14 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
+        if (
+            lower_bound is not None
+            and not isinstance(self.decode_kernel, TritonKDAKernel)
+            and not self.decode_kernel.supports_safe_gate_decode
         ):
             raise NotImplementedError(
-                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
-                f"got {self.decode_kernel.__class__.__name__}."
+                f"lower_bound (safe gate) decode is not supported by "
+                f"{self.decode_kernel.__class__.__name__}."
             )
         return self.decode_kernel.decode(
             q,
@@ -415,6 +431,8 @@ class KDAKernelDispatcher:
         FlashInfer's grouped recurrent kernel, which only accepts a bf16 state
         pool; the KDA pool is fp32, so route those batches to Triton."""
         kernel = self.extend_kernel
+        if self.batch_invariant:
+            return kernel
         if self.prefill_backend.is_flashinfer() and num_tokens <= max(num_seqs, 1):
             return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
@@ -489,7 +507,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        batch_invariant_kernel = None
+        if get_exec().mamba.enable_linear_attn_batch_invariant:
+            batch_invariant_kernel = create_kda_batch_invariant_kernel(
+                model_config=self._model_runner.model_config,
+                state_chunk_size=self.mamba_chunk_size,
+                # [pool layers, slots, HV, V, K]
+                temporal=self.state_pool.mamba_cache.temporal,
+                pool_layers=sorted(set(self.state_layer_indices.values())),
+                enable_unified_memory=self.enable_unified_memory,
+            )
+        return KDAKernelDispatcher(
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            batch_invariant_kernel=batch_invariant_kernel,
+        )
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -627,6 +660,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
+            # The batch-invariant prefill plans its launches on the host.
+            and not self.kernel_dispatcher.batch_invariant
             and (
                 isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
                 or getattr(
@@ -906,8 +941,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # gated RMSNorm in one kernel. Engages only when the model handed off
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
-        # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
+        # norm itself whenever the stash is left unconsumed. The fused kernel
+        # computes other bits than the batch-invariant class, which skips it.
+        if replayssm_d is None and not self.kernel_dispatcher.batch_invariant:
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (
@@ -1217,6 +1253,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             beta_is_raw=True,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.

@@ -572,5 +572,6 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
+    "enable_linear_attn_batch_invariant",
 )
 # fmt: on
